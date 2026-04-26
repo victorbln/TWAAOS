@@ -1,56 +1,264 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+import sqlite3
+import jwt
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
+from typing import Optional
 
-app = FastAPI(title="Gestiune inventar", version="1.0.0")
-
-
-class Produs(BaseModel):
-    id: int
-    nume: str
-    pret: float
-    stoc: int = 0
-
-
-inventar: list[Produs] = []
+from fastapi import Depends, FastAPI, HTTPException
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from passlib.context import CryptContext
+from pydantic import BaseModel, Field, field_validator
 
 
-@app.get("/produse")
-def obtine_toate_produsele(stoc_minim: int | None = None):
-    if stoc_minim is not None:
-        return [p for p in inventar if p.stoc < stoc_minim]
-    return inventar
+DATABASE = "sarcini.db"
+SECRET_KEY = "cheie-secreta-foarte-lunga-schimbati-obligatoriu-in-productie"
+ALGORITHM = "HS256"
+EXPIRARE_TOKEN_MINUTE = 30
+
+context_parola = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_schema = OAuth2PasswordBearer(tokenUrl="autentificare")
 
 
-@app.get("/produse/{produs_id}")
-def obtine_produs(produs_id: int):
-    for produs in inventar:
-        if produs.id == produs_id:
-            return produs
-    raise HTTPException(status_code=404, detail=f"Produsul cu ID-ul {produs_id} nu a fost gasit.")
+def initializeaza_db():
+    conn = sqlite3.connect(DATABASE)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS utilizatori (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT UNIQUE NOT NULL,
+            parola_hash TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS sarcini (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            titlu TEXT NOT NULL,
+            descriere TEXT,
+            finalizata INTEGER DEFAULT 0,
+            utilizator_id INTEGER NOT NULL,
+            FOREIGN KEY (utilizator_id) REFERENCES utilizatori(id)
+        )
+    """)
+    conn.commit()
+    conn.close()
 
 
-@app.post("/produse", status_code=201)
-def adauga_produs(produs: Produs):
-    for p in inventar:
-        if p.id == produs.id:
-            raise HTTPException(status_code=400, detail=f"Produsul cu ID-ul {produs.id} exista deja.")
-    inventar.append(produs)
-    return produs
+def get_db():
+    conn = sqlite3.connect(DATABASE, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA foreign_keys = ON")
+        yield conn
+    finally:
+        conn.close()
 
 
-@app.put("/produse/{produs_id}")
-def actualizeaza_produs(produs_id: int, produs: Produs):
-    for i, p in enumerate(inventar):
-        if p.id == produs_id:
-            inventar[i] = produs
-            return inventar[i]
-    raise HTTPException(status_code=404, detail=f"Produsul cu ID-ul {produs_id} nu a fost gasit.")
+@asynccontextmanager
+async def durata_de_viata(app: FastAPI):
+    initializeaza_db()
+    yield
 
 
-@app.delete("/produse/{produs_id}")
-def sterge_produs(produs_id: int):
-    for i, produs in enumerate(inventar):
-        if produs.id == produs_id:
-            produs_sters = inventar.pop(i)
-            return produs_sters
-    raise HTTPException(status_code=404, detail=f"Produsul cu ID-ul {produs_id} nu a fost gasit.")
+app = FastAPI(title="Gestionar de sarcini", version="1.0.0", lifespan=durata_de_viata)
+
+
+class UtilizatorInregistrare(BaseModel):
+    email: str = Field(min_length=5, max_length=100)
+    parola: str = Field(min_length=8, max_length=100)
+
+    @field_validator("email")
+    @classmethod
+    def email_valid(cls, v: str) -> str:
+        if "@" not in v or "." not in v.split("@")[-1]:
+            raise ValueError("Adresa de email nu este valida.")
+        return v.lower()
+
+
+class SarcinaCreare(BaseModel):
+    titlu: str = Field(min_length=1, max_length=200)
+    descriere: Optional[str] = Field(default=None, max_length=1000)
+
+
+class SarcinaActualizare(BaseModel):
+    titlu: Optional[str] = Field(default=None, min_length=1, max_length=200)
+    descriere: Optional[str] = Field(default=None, max_length=1000)
+    finalizata: Optional[bool] = None
+
+
+def hasheaza_parola(parola: str) -> str:
+    return context_parola.hash(parola)
+
+
+def verifica_parola(parola: str, hash_parola: str) -> bool:
+    return context_parola.verify(parola, hash_parola)
+
+
+def creeaza_token(date: dict) -> str:
+    date_copie = date.copy()
+    date_copie["exp"] = datetime.now(timezone.utc) + timedelta(minutes=EXPIRARE_TOKEN_MINUTE)
+    return jwt.encode(date_copie, SECRET_KEY, algorithm=ALGORITHM)
+
+
+def get_utilizator_curent(
+    token: str = Depends(oauth2_schema),
+    db: sqlite3.Connection = Depends(get_db),
+):
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        email: str = payload.get("sub")
+        if not email:
+            raise HTTPException(status_code=401, detail="Token invalid.")
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expirat. Autentificati-va din nou.")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Token invalid.")
+
+    utilizator = db.execute(
+        "SELECT * FROM utilizatori WHERE email = ?", (email,)
+    ).fetchone()
+    if not utilizator:
+        raise HTTPException(status_code=401, detail="Utilizatorul nu exista.")
+    return utilizator
+
+
+@app.post("/inregistrare", status_code=201)
+def inregistrare(utilizator: UtilizatorInregistrare, db: sqlite3.Connection = Depends(get_db)):
+    existent = db.execute(
+        "SELECT id FROM utilizatori WHERE email = ?", (utilizator.email,)
+    ).fetchone()
+    if existent:
+        raise HTTPException(status_code=400, detail="Adresa de email este deja inregistrata.")
+
+    db.execute(
+        "INSERT INTO utilizatori (email, parola_hash) VALUES (?, ?)",
+        (utilizator.email, hasheaza_parola(utilizator.parola)),
+    )
+    db.commit()
+    return {"mesaj": f"Utilizatorul {utilizator.email} a fost inregistrat cu succes."}
+
+
+@app.post("/autentificare")
+def autentificare(
+    formular: OAuth2PasswordRequestForm = Depends(),
+    db: sqlite3.Connection = Depends(get_db),
+):
+    utilizator = db.execute(
+        "SELECT * FROM utilizatori WHERE email = ?", (formular.username,)
+    ).fetchone()
+    if not utilizator or not verifica_parola(formular.password, utilizator["parola_hash"]):
+        raise HTTPException(status_code=401, detail="Email sau parola incorecta.")
+
+    token = creeaza_token({"sub": utilizator["email"]})
+    return {"access_token": token, "token_type": "bearer"}
+
+
+@app.get("/sarcini")
+def obtine_sarcini(
+    doar_nefinalizate: bool = False,
+    db: sqlite3.Connection = Depends(get_db),
+    utilizator_curent=Depends(get_utilizator_curent),
+):
+    if doar_nefinalizate:
+        sarcini = db.execute(
+            "SELECT * FROM sarcini WHERE utilizator_id = ? AND finalizata = 0",
+            (utilizator_curent["id"],)
+        ).fetchall()
+    else:
+        sarcini = db.execute(
+            "SELECT * FROM sarcini WHERE utilizator_id = ?", (utilizator_curent["id"],)
+        ).fetchall()
+    return [dict(s) for s in sarcini]
+
+
+@app.get("/sarcini/{sarcina_id}")
+def obtine_sarcina(
+    sarcina_id: int,
+    db: sqlite3.Connection = Depends(get_db),
+    utilizator_curent=Depends(get_utilizator_curent),
+):
+    sarcina = db.execute(
+        "SELECT * FROM sarcini WHERE id = ? AND utilizator_id = ?",
+        (sarcina_id, utilizator_curent["id"]),
+    ).fetchone()
+    if not sarcina:
+        raise HTTPException(status_code=404, detail="Sarcina nu a fost gasita.")
+    return dict(sarcina)
+
+
+@app.post("/sarcini", status_code=201)
+def creeaza_sarcina(
+    sarcina: SarcinaCreare,
+    db: sqlite3.Connection = Depends(get_db),
+    utilizator_curent=Depends(get_utilizator_curent),
+):
+    cursor = db.execute(
+        "INSERT INTO sarcini (titlu, descriere, utilizator_id) VALUES (?, ?, ?)",
+        (sarcina.titlu, sarcina.descriere, utilizator_curent["id"]),
+    )
+    db.commit()
+    sarcina_noua = db.execute(
+        "SELECT * FROM sarcini WHERE id = ?", (cursor.lastrowid,)
+    ).fetchone()
+    return dict(sarcina_noua)
+
+
+@app.put("/sarcini/{sarcina_id}")
+def actualizeaza_sarcina(
+    sarcina_id: int,
+    date: SarcinaActualizare,
+    db: sqlite3.Connection = Depends(get_db),
+    utilizator_curent=Depends(get_utilizator_curent),
+):
+    sarcina = db.execute(
+        "SELECT * FROM sarcini WHERE id = ? AND utilizator_id = ?",
+        (sarcina_id, utilizator_curent["id"]),
+    ).fetchone()
+    if not sarcina:
+        raise HTTPException(status_code=404, detail="Sarcina nu a fost gasita.")
+
+    sarcina_dict = dict(sarcina)
+    titlu_nou = date.titlu if date.titlu is not None else sarcina_dict["titlu"]
+    descriere_noua = date.descriere if date.descriere is not None else sarcina_dict["descriere"]
+    finalizata_noua = int(date.finalizata) if date.finalizata is not None else sarcina_dict["finalizata"]
+
+    db.execute(
+        "UPDATE sarcini SET titlu = ?, descriere = ?, finalizata = ? WHERE id = ?",
+        (titlu_nou, descriere_noua, finalizata_noua, sarcina_id),
+    )
+    db.commit()
+    return dict(db.execute("SELECT * FROM sarcini WHERE id = ?", (sarcina_id,)).fetchone())
+
+
+@app.patch("/sarcini/{sarcina_id}/finalizeaza")
+def finalizeaza_sarcina(
+    sarcina_id: int,
+    db: sqlite3.Connection = Depends(get_db),
+    utilizator_curent=Depends(get_utilizator_curent),
+):
+    sarcina = db.execute(
+        "SELECT * FROM sarcini WHERE id = ? AND utilizator_id = ?",
+        (sarcina_id, utilizator_curent["id"]),
+    ).fetchone()
+    if not sarcina:
+        raise HTTPException(status_code=404, detail="Sarcina nu a fost gasita.")
+
+    db.execute("UPDATE sarcini SET finalizata = 1 WHERE id = ?", (sarcina_id,))
+    db.commit()
+    return dict(db.execute("SELECT * FROM sarcini WHERE id = ?", (sarcina_id,)).fetchone())
+
+
+@app.delete("/sarcini/{sarcina_id}")
+def sterge_sarcina(
+    sarcina_id: int,
+    db: sqlite3.Connection = Depends(get_db),
+    utilizator_curent=Depends(get_utilizator_curent),
+):
+    sarcina = db.execute(
+        "SELECT * FROM sarcini WHERE id = ? AND utilizator_id = ?",
+        (sarcina_id, utilizator_curent["id"]),
+    ).fetchone()
+    if not sarcina:
+        raise HTTPException(status_code=404, detail="Sarcina nu a fost gasita.")
+
+    db.execute("DELETE FROM sarcini WHERE id = ?", (sarcina_id,))
+    db.commit()
+    return {"mesaj": f"Sarcina cu ID-ul {sarcina_id} a fost stearsa."}
