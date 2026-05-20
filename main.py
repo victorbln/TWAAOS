@@ -1,27 +1,31 @@
+import os
 import sqlite3
 import jwt
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from passlib.context import CryptContext
 from pydantic import BaseModel, Field, field_validator
 
+load_dotenv()
 
-DATABASE = "sarcini.db"
-SECRET_KEY = "cheie-secreta-foarte-lunga-schimbati-obligatoriu-in-productie"
-ALGORITHM = "HS256"
-EXPIRARE_TOKEN_MINUTE = 30
+DATABASE_PATH = os.environ.get("DATABASE_PATH", "sarcini.db")
+SECRET_KEY = os.environ.get("SECRET_KEY", "cheie-implicita-doar-pentru-dev")
+ALGORITHM = os.environ.get("ALGORITHM", "HS256")
+EXPIRARE_TOKEN_MINUTE = int(os.environ.get("EXPIRARE_TOKEN_MINUTE", "30"))
 
 context_parola = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_schema = OAuth2PasswordBearer(tokenUrl="autentificare")
 
 
 def initializeaza_db():
-    conn = sqlite3.connect(DATABASE)
+    conn = sqlite3.connect(DATABASE_PATH)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS utilizatori (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -44,7 +48,7 @@ def initializeaza_db():
 
 
 def get_db():
-    conn = sqlite3.connect(DATABASE, check_same_thread=False)
+    conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     try:
         conn.execute("PRAGMA foreign_keys = ON")
@@ -275,3 +279,11 @@ def sterge_sarcina(
     db.execute("DELETE FROM sarcini WHERE id = ?", (sarcina_id,))
     db.commit()
     return {"mesaj": f"Sarcina cu ID-ul {sarcina_id} a fost stearsa."}
+
+
+@app.get("/healthz")
+def health_check():
+    return {"status": "ok"}
+
+
+app.mount("/", StaticFiles(directory="static", html=True), name="static")

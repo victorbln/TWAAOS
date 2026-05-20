@@ -1,0 +1,14 @@
+# Configuratie locala - nu se urca pe GitHub
+.env
+
+# Baza de date locala
+*.db
+
+# Cache Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Mediul virtual
+venv/
+.venv/
