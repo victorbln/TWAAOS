@@ -1,5 +1,6 @@
 import os
 import sqlite3
+import bcrypt
 import jwt
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -10,27 +11,17 @@ from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from passlib.context import CryptContext
 from pydantic import BaseModel, Field, field_validator
 
 load_dotenv()
-
-# ---------------------------------------------------------------------------
-# Configurare
-# ---------------------------------------------------------------------------
 
 DATABASE_PATH = os.environ.get("DATABASE_PATH", "sarcini.db")
 SECRET_KEY = os.environ.get("SECRET_KEY", "cheie-implicita-doar-pentru-dev")
 ALGORITHM = os.environ.get("ALGORITHM", "HS256")
 EXPIRARE_TOKEN_MINUTE = int(os.environ.get("EXPIRARE_TOKEN_MINUTE", "30"))
 
-context_parola = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_schema = OAuth2PasswordBearer(tokenUrl="autentificare")
 
-
-# ---------------------------------------------------------------------------
-# Baza de date
-# ---------------------------------------------------------------------------
 
 def initializeaza_db():
     conn = sqlite3.connect(DATABASE_PATH)
@@ -71,10 +62,6 @@ async def durata_de_viata(app: FastAPI):
     yield
 
 
-# ---------------------------------------------------------------------------
-# Aplicatia
-# ---------------------------------------------------------------------------
-
 app = FastAPI(title="Gestionar de sarcini", version="2.0.0", lifespan=durata_de_viata)
 
 app.add_middleware(
@@ -89,10 +76,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-# ---------------------------------------------------------------------------
-# Modele Pydantic
-# ---------------------------------------------------------------------------
 
 class UtilizatorInregistrare(BaseModel):
     email: str = Field(min_length=5, max_length=100)
@@ -117,16 +100,12 @@ class SarcinaActualizare(BaseModel):
     finalizata: Optional[bool] = None
 
 
-# ---------------------------------------------------------------------------
-# Functii utilitare
-# ---------------------------------------------------------------------------
-
 def hasheaza_parola(parola: str) -> str:
-    return context_parola.hash(parola)
+    return bcrypt.hashpw(parola.encode(), bcrypt.gensalt()).decode()
 
 
 def verifica_parola(parola: str, hash_parola: str) -> bool:
-    return context_parola.verify(parola, hash_parola)
+    return bcrypt.checkpw(parola.encode(), hash_parola.encode())
 
 
 def creeaza_token(date: dict) -> str:
@@ -157,18 +136,10 @@ def get_utilizator_curent(
     return utilizator
 
 
-# ---------------------------------------------------------------------------
-# Endpoint-uri: health check
-# ---------------------------------------------------------------------------
-
 @app.get("/healthz")
 def health_check():
     return {"status": "ok"}
 
-
-# ---------------------------------------------------------------------------
-# Endpoint-uri: autentificare
-# ---------------------------------------------------------------------------
 
 @app.post("/inregistrare", status_code=201)
 def inregistrare(utilizator: UtilizatorInregistrare, db: sqlite3.Connection = Depends(get_db)):
@@ -200,10 +171,6 @@ def autentificare(
     token = creeaza_token({"sub": utilizator["email"]})
     return {"access_token": token, "token_type": "bearer"}
 
-
-# ---------------------------------------------------------------------------
-# Endpoint-uri: sarcini (protejate cu JWT)
-# ---------------------------------------------------------------------------
 
 @app.get("/sarcini")
 def obtine_sarcini(
@@ -318,5 +285,4 @@ def sterge_sarcina(
     return {"mesaj": f"Sarcina cu ID-ul {sarcina_id} a fost stearsa."}
 
 
-# Trebuie sa fie ULTIMUL apel - prinde toate rutele nerezolvate de endpoint-uri
 app.mount("/", StaticFiles(directory="static", html=True), name="static")
