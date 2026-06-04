@@ -15,6 +15,10 @@ from pydantic import BaseModel, Field, field_validator
 
 load_dotenv()
 
+# ---------------------------------------------------------------------------
+# Configurare
+# ---------------------------------------------------------------------------
+
 DATABASE_PATH = os.environ.get("DATABASE_PATH", "sarcini.db")
 SECRET_KEY = os.environ.get("SECRET_KEY", "cheie-implicita-doar-pentru-dev")
 ALGORITHM = os.environ.get("ALGORITHM", "HS256")
@@ -23,6 +27,10 @@ EXPIRARE_TOKEN_MINUTE = int(os.environ.get("EXPIRARE_TOKEN_MINUTE", "30"))
 context_parola = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_schema = OAuth2PasswordBearer(tokenUrl="autentificare")
 
+
+# ---------------------------------------------------------------------------
+# Baza de date
+# ---------------------------------------------------------------------------
 
 def initializeaza_db():
     conn = sqlite3.connect(DATABASE_PATH)
@@ -63,7 +71,11 @@ async def durata_de_viata(app: FastAPI):
     yield
 
 
-app = FastAPI(title="Gestionar de sarcini", version="1.0.0", lifespan=durata_de_viata)
+# ---------------------------------------------------------------------------
+# Aplicatia
+# ---------------------------------------------------------------------------
+
+app = FastAPI(title="Gestionar de sarcini", version="2.0.0", lifespan=durata_de_viata)
 
 app.add_middleware(
     CORSMiddleware,
@@ -77,6 +89,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+# ---------------------------------------------------------------------------
+# Modele Pydantic
+# ---------------------------------------------------------------------------
 
 class UtilizatorInregistrare(BaseModel):
     email: str = Field(min_length=5, max_length=100)
@@ -100,6 +116,10 @@ class SarcinaActualizare(BaseModel):
     descriere: Optional[str] = Field(default=None, max_length=1000)
     finalizata: Optional[bool] = None
 
+
+# ---------------------------------------------------------------------------
+# Functii utilitare
+# ---------------------------------------------------------------------------
 
 def hasheaza_parola(parola: str) -> str:
     return context_parola.hash(parola)
@@ -137,6 +157,19 @@ def get_utilizator_curent(
     return utilizator
 
 
+# ---------------------------------------------------------------------------
+# Endpoint-uri: health check
+# ---------------------------------------------------------------------------
+
+@app.get("/healthz")
+def health_check():
+    return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Endpoint-uri: autentificare
+# ---------------------------------------------------------------------------
+
 @app.post("/inregistrare", status_code=201)
 def inregistrare(utilizator: UtilizatorInregistrare, db: sqlite3.Connection = Depends(get_db)):
     existent = db.execute(
@@ -167,6 +200,10 @@ def autentificare(
     token = creeaza_token({"sub": utilizator["email"]})
     return {"access_token": token, "token_type": "bearer"}
 
+
+# ---------------------------------------------------------------------------
+# Endpoint-uri: sarcini (protejate cu JWT)
+# ---------------------------------------------------------------------------
 
 @app.get("/sarcini")
 def obtine_sarcini(
@@ -281,9 +318,5 @@ def sterge_sarcina(
     return {"mesaj": f"Sarcina cu ID-ul {sarcina_id} a fost stearsa."}
 
 
-@app.get("/healthz")
-def health_check():
-    return {"status": "ok"}
-
-
+# Trebuie sa fie ULTIMUL apel - prinde toate rutele nerezolvate de endpoint-uri
 app.mount("/", StaticFiles(directory="static", html=True), name="static")
